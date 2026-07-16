@@ -255,7 +255,8 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "For the camera the app uses to translate.";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = qwertrergfewf;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "To record audio with your videos.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "To transcribe what you say while recording a video.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -301,7 +302,8 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "For the camera the app uses to translate.";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = qwertrergfewf;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "To record audio with your videos.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "To transcribe what you say while recording a video.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;

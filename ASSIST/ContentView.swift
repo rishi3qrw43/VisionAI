@@ -5,6 +5,7 @@ import Vision
 import FoundationModels
 import Combine
 import UIKit
+import Speech
 
 // MARK: - Localization System
 enum AppLanguage: String, CaseIterable, Identifiable {
@@ -38,6 +39,17 @@ enum AppLanguage: String, CaseIterable, Identifiable {
     }
 
     var isRTL: Bool { self == .arabic }
+
+    /// Region-qualified locale for speech recognition (bare language codes aren't always recognized).
+    var speechLocaleIdentifier: String {
+        switch self {
+        case .english: return "en-US"
+        case .spanish: return "es-ES"
+        case .chinese: return "zh-CN"
+        case .french: return "fr-FR"
+        case .arabic: return "ar-SA"
+        }
+    }
 }
 
 // Application screens
@@ -180,7 +192,6 @@ class AppState: ObservableObject {
     @Published var isPlaying = false
     @Published var chatInput = ""
     @Published var isRecording = false
-    @Published var transcriptIndex = 0
 
     // Live scan result state (updated after each real scan)
     @Published var lastScanTitle: String = ""
@@ -206,13 +217,6 @@ class AppState: ObservableObject {
     }
 
     let languages = AppLanguage.allCases
-
-    let transcriptionSteps = [
-        "What is…",
-        "What is this…",
-        "What is this object…",
-        "What is this object called?",
-    ]
 
     func deleteItem(_ id: Int) {
         if let idx = historyItems.firstIndex(where: { $0.id == id }) {
@@ -381,7 +385,7 @@ extension Color {
 
 // MARK: - Camera
 
-class CameraManager: ObservableObject {
+class CameraManager: NSObject, ObservableObject {
     let session = AVCaptureSession()
     @Published var isSetup = false
     @Published var lastCapturedImageURL: URL? = nil
@@ -393,6 +397,13 @@ class CameraManager: ObservableObject {
     private var photoCaptureDelegates: [PhotoCaptureDelegate] = []
     private var movieRecordingDelegates: [MovieRecordingDelegate] = []
     var isRecording: Bool { movieOutput.isRecording }
+
+    // MARK: - Live speech transcription (what the user actually says while recording)
+    private let audioDataOutput = AVCaptureAudioDataOutput()
+    private let audioProcessingQueue = DispatchQueue(label: "com.assist.audioProcessing")
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    @Published var liveTranscript: String = ""
 
     func setup() {
         guard !isSetup else { return }
@@ -434,6 +445,8 @@ class CameraManager: ObservableObject {
         }
         if session.canAddOutput(photoOutput) { session.addOutput(photoOutput) }
         if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
+        audioDataOutput.setSampleBufferDelegate(self, queue: audioProcessingQueue)
+        if session.canAddOutput(audioDataOutput) { session.addOutput(audioDataOutput) }
         session.commitConfiguration()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.session.startRunning()
@@ -465,8 +478,8 @@ class CameraManager: ObservableObject {
     // MARK: - Video Recording
     private var pendingRecordingCompletion: ((URL?) -> Void)?
 
-    func startRecording(maxDuration: Int? = nil) {
-        guard !movieOutput.isRecording else { return }
+    func startRecording(maxDuration: Int? = nil, transcriptionLocale: Locale = Locale(identifier: "en-US")) {
+        guard isSetup, !movieOutput.isRecording else { return }
         // Save directly to Documents so recordings persist
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let fileURL = docs.appendingPathComponent(UUID().uuidString + ".mov")
@@ -478,15 +491,57 @@ class CameraManager: ObservableObject {
         let delegate = MovieRecordingDelegate(parent: self, fileURL: fileURL)
         movieRecordingDelegates.append(delegate)
         movieOutput.startRecording(to: fileURL, recordingDelegate: delegate)
+        startTranscription(locale: transcriptionLocale)
     }
 
     func stopRecording(completion: ((URL?) -> Void)? = nil) {
+        stopTranscription()
         guard movieOutput.isRecording else {
             completion?(nil)
             return
         }
         pendingRecordingCompletion = completion
         movieOutput.stopRecording()
+    }
+
+    private func startTranscription(locale: Locale) {
+        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+            guard status == .authorized else { return }
+            self?.audioProcessingQueue.async { self?.beginRecognition(locale: locale) }
+        }
+    }
+
+    private func beginRecognition(locale: Locale) {
+        guard let recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer(),
+              recognizer.isAvailable else { return }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        recognitionRequest = request
+        DispatchQueue.main.async { self.liveTranscript = "" }
+
+        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            if let result {
+                let text = result.bestTranscription.formattedString
+                DispatchQueue.main.async { self.liveTranscript = text }
+            }
+            if error != nil || result?.isFinal == true {
+                self.audioProcessingQueue.async {
+                    self.recognitionTask = nil
+                    self.recognitionRequest = nil
+                }
+            }
+        }
+    }
+
+    private func stopTranscription() {
+        audioProcessingQueue.async { [weak self] in
+            self?.recognitionRequest?.endAudio()
+            self?.recognitionTask?.cancel()
+            self?.recognitionTask = nil
+            self?.recognitionRequest = nil
+        }
     }
 
     fileprivate func handleRecordingFinished(_ fileURL: URL?) {
@@ -605,6 +660,12 @@ class CameraManager: ObservableObject {
     // helper to clean up delegates if needed
     private func removeRecordingDelegate(_ d: MovieRecordingDelegate) {
         movieRecordingDelegates.removeAll { $0 === d }
+    }
+}
+
+extension CameraManager: AVCaptureAudioDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        recognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
     }
 }
 
@@ -991,23 +1052,6 @@ struct HomeView: View {
                         Spacer()
                     }
                     .padding(12)
-
-                    VStack {
-                        Spacer()
-                        HStack {
-                            Spacer()
-                            // Quick capture button inside the viewfinder
-                            Button {
-                                capturePhoto()
-                            } label: {
-                                ZStack {
-                                    Circle().fill(.ultraThinMaterial).frame(width: 40, height: 40)
-                                    Image(systemName: "camera").foregroundColor(.white).font(.system(size: 16))
-                                }
-                            }
-                        }
-                    }
-                    .padding(12)
                 }
                 .frame(height: 248)
                 .clipShape(RoundedRectangle(cornerRadius: 24))
@@ -1109,7 +1153,6 @@ struct HomeView: View {
                     }
                     .onLongPressGesture(minimumDuration: 0.5) {
                         guard !state.isAnalyzing else { return }
-                        state.transcriptIndex = 0
                         state.isRecording = true
                         state.screen = .recording
                     }
@@ -1630,13 +1673,12 @@ struct RecordingView: View {
                     .foregroundColor(.white.opacity(0.85))
                     .padding(.bottom, 6)
 
-                Text(state.transcriptionSteps[state.transcriptIndex % state.transcriptionSteps.count])
+                Text(camera.liveTranscript.isEmpty ? "Listening…" : camera.liveTranscript)
                     .font(.system(size: 24, weight: .bold))
                     .foregroundColor(.white)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 32)
-                    .id(state.transcriptIndex)
-                    .transition(.opacity)
+                    .animation(.easeInOut(duration: 0.15), value: camera.liveTranscript)
 
                 Spacer().frame(height: 40)
 
@@ -1666,14 +1708,14 @@ struct RecordingView: View {
     }
 
     private func startRecordingFlow() {
-        camera.startRecording(maxDuration: state.videoMaxDuration)
+        camera.startRecording(
+            maxDuration: state.videoMaxDuration,
+            transcriptionLocale: Locale(identifier: state.currentLanguage.speechLocaleIdentifier)
+        )
         elapsed = 0
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
             elapsed += 1
-            if elapsed % 2 == 0 {
-                withAnimation { state.transcriptIndex = (state.transcriptIndex + 1) % state.transcriptionSteps.count }
-            }
             if elapsed >= state.videoMaxDuration {
                 stopAndSend()
             }
