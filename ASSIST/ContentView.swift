@@ -398,15 +398,27 @@ class CameraManager: ObservableObject {
         guard !isSetup else { return }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
-            configureSession()
+            requestAudioThenConfigure()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                if granted {
-                    DispatchQueue.main.async { self?.configureSession() }
-                }
+                guard granted else { return }
+                DispatchQueue.main.async { self?.requestAudioThenConfigure() }
             }
         default:
             break
+        }
+    }
+
+    /// Recorded video needs audio too — resolve mic permission before wiring up the session
+    /// rather than relying on an implicit prompt when the session starts running.
+    private func requestAudioThenConfigure() {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in
+                DispatchQueue.main.async { self?.configureSession() }
+            }
+        default:
+            configureSession()
         }
     }
 
@@ -489,42 +501,39 @@ class CameraManager: ObservableObject {
             return
         }
 
-        // generate thumbnail
-        let thumbURL = generateThumbnail(for: fileURL)
-
-        DispatchQueue.main.async {
-            self.lastCapturedVideoURL = fileURL
-            self.lastCapturedVideoThumbnailURL = thumbURL
-            if let cb = self.pendingRecordingCompletion {
-                self.pendingRecordingCompletion = nil
-                cb(fileURL)
+        // generate thumbnail asynchronously — never block this queue waiting on it
+        generateThumbnailAsync(for: fileURL) { [weak self] thumbURL in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                self.lastCapturedVideoURL = fileURL
+                self.lastCapturedVideoThumbnailURL = thumbURL
+                if let cb = self.pendingRecordingCompletion {
+                    self.pendingRecordingCompletion = nil
+                    cb(fileURL)
+                }
             }
         }
     }
 
-    private func generateThumbnail(for url: URL) -> URL? {
+    private func generateThumbnailAsync(for url: URL, completion: @escaping (URL?) -> Void) {
         let asset = AVURLAsset(url: url)
         let imgGen = AVAssetImageGenerator(asset: asset)
         imgGen.appliesPreferredTrackTransform = true
         let time = CMTimeMake(value: 1, timescale: 2) // 0.5s
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var resultURL: URL?
-
         imgGen.generateCGImageAsynchronously(for: time) { cgImage, _, _ in
-            defer { semaphore.signal() }
-            guard let cgImage else { return }
+            guard let cgImage else { completion(nil); return }
             let ui = UIImage(cgImage: cgImage)
-            if let data = ui.jpegData(compressionQuality: 0.8) {
-                let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-                let thumbURL = docs.appendingPathComponent(url.deletingPathExtension().lastPathComponent + "_thumb.jpg")
-                try? data.write(to: thumbURL)
-                resultURL = thumbURL
+            guard let data = ui.jpegData(compressionQuality: 0.8) else { completion(nil); return }
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            let thumbURL = docs.appendingPathComponent(url.deletingPathExtension().lastPathComponent + "_thumb.jpg")
+            do {
+                try data.write(to: thumbURL)
+                completion(thumbURL)
+            } catch {
+                completion(nil)
             }
         }
-        semaphore.wait()
-
-        return resultURL
     }
 
     var recordedDurationSeconds: Double {
