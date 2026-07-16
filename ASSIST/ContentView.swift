@@ -54,7 +54,7 @@ enum AppLanguage: String, CaseIterable, Identifiable {
 
 // Application screens
 enum AppScreen: Equatable {
-    case login, home, language, history, video, menu, recording
+    case login, home, language, history, video, menu, recording, document
     case historyDetail(Int), accessibility, notifications, about, videoSettings
 }
 
@@ -150,6 +150,10 @@ enum HistoryTab: Hashable {
     case scans, videos, trash
 }
 
+enum ScanMode: Hashable {
+    case object, document
+}
+
 struct HistoryItem: Identifiable, Codable {
     let id: Int
     let type: String
@@ -195,6 +199,17 @@ class AppState: ObservableObject {
     @Published var lastScanQuestion: String = ""
     @Published var isAnalyzing: Bool = false
     @Published var isGeneratingResponse: Bool = false
+
+    // Document scan: object vs. text/label/form scanning
+    @Published var scanMode: ScanMode = .object
+    @Published var lastDocumentRawText: String = ""
+    @Published var lastDocumentSimplified: String = ""
+    @Published var lastDocumentTranslated: String = ""
+    @Published var isAnalyzingDocument: Bool = false
+    @Published var documentMessages: [ChatMessage] = []
+    @Published var documentChatInput: String = ""
+    @Published var isGeneratingDocumentResponse: Bool = false
+    private var documentChatSession: LanguageModelSession?
 
     // Video settings
     @Published var videoQuality: String = "1080p"
@@ -323,6 +338,112 @@ class AppState: ObservableObject {
                 }
                 isAnalyzing = false
             }
+        }
+    }
+
+    // MARK: - AI: Document scan (Vision text recognition → FoundationModels simplify + translate)
+
+    func analyzeDocument(imageURL: URL) async {
+        await MainActor.run {
+            documentMessages = []
+            documentChatSession = nil
+            isAnalyzingDocument = true
+        }
+
+        // Vision: recognize text in the photo (labels, forms, printed text)
+        var recognizedText = ""
+        do {
+            var request = RecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            let results = try await request.perform(on: imageURL)
+            recognizedText = results
+                .compactMap { $0.topCandidates(1).first?.string }
+                .joined(separator: "\n")
+        } catch {
+            // Text recognition failed — nothing to show
+        }
+
+        guard !recognizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            await MainActor.run {
+                lastDocumentRawText = ""
+                lastDocumentSimplified = "No readable text found. Try holding the camera steadier or getting closer."
+                lastDocumentTranslated = ""
+                isAnalyzingDocument = false
+            }
+            return
+        }
+
+        // Cap to avoid LanguageModelSession context-window overflow on long documents.
+        let cappedText = String(recognizedText.prefix(2500))
+        let langName = currentLanguage.displayName
+
+        do {
+            let session = LanguageModelSession(
+                instructions: "You help people understand complex documents like prescription labels and government forms by simplifying jargon and translating into their language."
+            )
+            let prompt = """
+            Here is text scanned from a document:
+            \(cappedText)
+
+            Reply in exactly this format:
+            SIMPLIFIED:
+            <a short, plain-language explanation of what this document says and means, free of jargon>
+            TRANSLATED:
+            <the same explanation translated into \(langName)>
+            """
+            let response = try await session.respond(to: prompt)
+            let content = response.content
+            var simplified = content
+            var translated = ""
+            if let range = content.range(of: "TRANSLATED:") {
+                simplified = String(content[content.startIndex..<range.lowerBound])
+                translated = String(content[range.upperBound...])
+            }
+            simplified = simplified.replacingOccurrences(of: "SIMPLIFIED:", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            translated = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            await MainActor.run {
+                lastDocumentRawText = recognizedText
+                lastDocumentSimplified = simplified
+                lastDocumentTranslated = translated
+                if let idx = historyItems.firstIndex(where: { $0.imageURL == imageURL.absoluteString }) {
+                    historyItems[idx].desc = simplified.isEmpty ? "Scanned document" : String(simplified.prefix(60))
+                }
+                isAnalyzingDocument = false
+            }
+        } catch {
+            await MainActor.run {
+                lastDocumentRawText = recognizedText
+                lastDocumentSimplified = "Found text, but couldn't simplify it right now."
+                lastDocumentTranslated = ""
+                isAnalyzingDocument = false
+            }
+        }
+    }
+
+    func sendDocumentMessage() {
+        let trimmed = documentChatInput.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !isGeneratingDocumentResponse else { return }
+        documentMessages.append(ChatMessage(role: "user", text: trimmed))
+        documentChatInput = ""
+        isGeneratingDocumentResponse = true
+        Task { await generateDocumentResponse(for: trimmed) }
+    }
+
+    @MainActor
+    private func generateDocumentResponse(for userText: String) async {
+        defer { isGeneratingDocumentResponse = false }
+        do {
+            if documentChatSession == nil {
+                documentChatSession = LanguageModelSession(
+                    instructions: "The user scanned this document. Simplified text: \(lastDocumentSimplified). Answer follow-up questions about it in \(currentLanguage.displayName). Be concise — 1-2 sentences."
+                )
+            }
+            let response = try await documentChatSession!.respond(to: userText)
+            documentMessages.append(ChatMessage(role: "ai", text: response.content))
+        } catch {
+            documentMessages.append(ChatMessage(role: "ai", text: "I couldn't process that. Please try again."))
         }
     }
 
@@ -724,6 +845,7 @@ struct ContentView: View {
                 case .language:    LanguageView(state: state)
                 case .history:     HistoryView(state: state)
                 case .video:       VideoView(state: state, camera: camera)
+                case .document:    DocumentView(state: state)
                 case .recording:   RecordingView(state: state, camera: camera)
                 case .menu:        MenuView(state: state)
                 case .historyDetail(let id): HistoryDetailView(state: state, itemId: id)
@@ -1035,6 +1157,27 @@ struct HomeView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 12)
 
+                // Object / Document scan mode toggle
+                HStack(spacing: 0) {
+                    ForEach([ScanMode.object, ScanMode.document], id: \.self) { mode in
+                        Button {
+                            state.scanMode = mode
+                        } label: {
+                            Text(mode == .object ? "Object" : "Document")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(state.scanMode == mode ? .white : .appPrimary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(state.scanMode == mode ? Color.appPrimary : Color.clear)
+                                .clipShape(Capsule())
+                        }
+                    }
+                }
+                .padding(4)
+                .background(Color.secondarySystemBg)
+                .clipShape(Capsule())
+                .padding(.horizontal, 16)
+
                 // Viewfinder
                 ZStack {
                     Color.black
@@ -1205,6 +1348,23 @@ struct HomeView: View {
                     let newId = (state.historyItems.map { $0.id }.max() ?? 0) + 1
                     let timeString = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
                     let dateString = DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .none)
+
+                    if state.scanMode == .document {
+                        state.historyItems.insert(HistoryItem(
+                            id: newId,
+                            type: "document",
+                            imageURL: url.absoluteString,
+                            desc: "Reading document…",
+                            time: timeString,
+                            date: dateString,
+                            deleted: false,
+                            previewURL: url.absoluteString
+                        ), at: 0)
+                        state.screen = .document
+                        Task { await state.analyzeDocument(imageURL: url) }
+                        return
+                    }
+
                     state.historyItems.insert(HistoryItem(
                         id: newId,
                         type: "scan",
@@ -1392,7 +1552,7 @@ struct HistoryView: View {
 
     private var filteredItems: [HistoryItem] {
         switch state.historyTab {
-        case .scans:  return state.historyItems.filter { $0.type == "scan" && !$0.deleted }
+        case .scans:  return state.historyItems.filter { ($0.type == "scan" || $0.type == "document") && !$0.deleted }
         case .videos: return state.historyItems.filter { $0.type == "video" && !$0.deleted }
         case .trash:  return state.historyItems.filter { $0.deleted }
         }
@@ -1439,7 +1599,7 @@ struct HistoryView: View {
                                 Text("\(item.date) · \(item.time)").font(.system(size: 12)).foregroundColor(.secondary)
                             }
                             Spacer()
-                            Image(systemName: item.type == "video" ? "video.fill" : "photo.fill")
+                            Image(systemName: item.type == "video" ? "video.fill" : (item.type == "document" ? "doc.text.fill" : "photo.fill"))
                                 .foregroundColor(.secondary)
                                 .font(.system(size: 13))
                         }
@@ -1647,6 +1807,110 @@ struct VideoView: View {
             .padding(12)
         }
         .background(Color.systemBg.ignoresSafeArea())
+    }
+}
+
+// MARK: - Document Scan
+
+struct DocumentView: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button { state.screen = .home } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.appPrimary)
+                }
+                Spacer()
+                Text("Read & Translate").font(.system(size: 17, weight: .bold))
+                Spacer()
+                Color.clear.frame(width: 20, height: 1)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            Divider()
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if state.isAnalyzingDocument {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                Text("Reading document…").font(.system(size: 15, weight: .semibold)).foregroundColor(.secondary)
+                            }
+                            .padding(16)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.secondarySystemBg)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+                        } else {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("SIMPLIFIED").font(.system(size: 11, weight: .bold)).foregroundColor(.secondary).tracking(1)
+                                Text(state.lastDocumentSimplified.isEmpty ? "No document scanned yet." : state.lastDocumentSimplified)
+                                    .font(.system(size: 15))
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(16)
+                            .background(Color.secondarySystemBg)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                            if !state.lastDocumentTranslated.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("TRANSLATED").font(.system(size: 11, weight: .bold)).foregroundColor(.white.opacity(0.8)).tracking(1)
+                                    Text(state.lastDocumentTranslated)
+                                        .font(.system(size: 15))
+                                        .foregroundColor(.white)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(16)
+                                .background(Color.appPrimary)
+                                .clipShape(RoundedRectangle(cornerRadius: 16))
+                            }
+                        }
+
+                        ForEach(state.documentMessages) { msg in
+                            ChatBubble(message: msg).id(msg.id)
+                        }
+                        if state.isGeneratingDocumentResponse {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                Text("Thinking…").font(.system(size: 13)).foregroundColor(.secondary)
+                            }
+                            .padding(.leading, 4)
+                        }
+                    }
+                    .padding(16)
+                }
+                .onChange(of: state.documentMessages.count) { _, _ in
+                    if let last = state.documentMessages.last {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                }
+            }
+
+            Divider()
+            HStack(spacing: 10) {
+                TextField("Ask about this document…", text: $state.documentChatInput)
+                    .padding(.horizontal, 14)
+                    .frame(height: 40)
+                    .background(Color.systemGray6Color)
+                    .clipShape(Capsule())
+                    .onSubmit { state.sendDocumentMessage() }
+                Button {
+                    state.sendDocumentMessage()
+                } label: {
+                    ZStack {
+                        Circle().fill(Color.appPrimary).frame(width: 40, height: 40)
+                        Image(systemName: "arrow.up").foregroundColor(.white).font(.system(size: 15, weight: .bold))
+                    }
+                }
+                .disabled(state.documentChatInput.trimmingCharacters(in: .whitespaces).isEmpty || state.isAnalyzingDocument || state.isGeneratingDocumentResponse)
+            }
+            .padding(12)
+        }
+        .background(Color.systemBg.ignoresSafeArea())
+        .environment(\.layoutDirection, state.currentLanguage.isRTL ? .rightToLeft : .leftToRight)
     }
 }
 
