@@ -150,7 +150,7 @@ enum HistoryTab: Hashable {
     case scans, videos, trash
 }
 
-struct HistoryItem: Identifiable {
+struct HistoryItem: Identifiable, Codable {
     let id: Int
     let type: String
     let imageURL: String
@@ -175,13 +175,9 @@ class AppState: ObservableObject {
     @Published var isLoggedIn = false
     @Published var userEmail = ""
     @Published var currentLanguage: AppLanguage = .english
-    @Published var historyItems: [HistoryItem] = [
-        HistoryItem(id: 1, type: "scan", imageURL: "https://images.unsplash.com/photo-1489824904134-891ab64532f1?w=120&h=120&fit=crop&auto=format", desc: "Movie theater with people", time: "3:42 PM", date: "Jun 20th, 2025", deleted: false, previewURL: nil),
-        HistoryItem(id: 2, type: "scan", imageURL: "https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=120&h=120&fit=crop&auto=format", desc: "Stop Sign — señal de stop", time: "11:08 AM", date: "Jun 20th, 2025", deleted: false, previewURL: nil),
-        HistoryItem(id: 3, type: "scan", imageURL: "https://images.unsplash.com/photo-1588964895597-cfccd6e2dbf9?w=120&h=120&fit=crop&auto=format", desc: "Broccoli — brócoli", time: "6:15 PM", date: "Jun 5th, 2025", deleted: false, previewURL: nil),
-        HistoryItem(id: 4, type: "video", imageURL: "https://images.unsplash.com/photo-1556909114-f6e7ad7d3136?w=120&h=120&fit=crop&auto=format", desc: "Pasta carbonara cooking tutorial", time: "2:10 PM", date: "Jun 5th, 2025", deleted: false, previewURL: nil),
-        HistoryItem(id: 5, type: "video", imageURL: "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=120&h=120&fit=crop&auto=format", desc: "Restaurant — Ask about the menu", time: "12:30 PM", date: "Jun 5th, 2025", deleted: false, previewURL: nil),
-    ]
+    @Published var historyItems: [HistoryItem] = [] {
+        didSet { saveHistoryItems() }
+    }
     @Published var historyTab: HistoryTab = .scans
     @Published var messages: [ChatMessage] = [
         ChatMessage(role: "user", text: "What is being cooked in this video?"),
@@ -217,6 +213,29 @@ class AppState: ObservableObject {
     }
 
     let languages = AppLanguage.allCases
+
+    init() {
+        self.historyItems = Self.loadHistoryItems()
+    }
+
+    // MARK: - Persistence (history.json in Documents)
+
+    private static var historyFileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("history.json")
+    }
+
+    private static func loadHistoryItems() -> [HistoryItem] {
+        guard let data = try? Data(contentsOf: historyFileURL),
+              let items = try? JSONDecoder().decode([HistoryItem].self, from: data)
+        else { return [] }
+        return items
+    }
+
+    private func saveHistoryItems() {
+        guard let data = try? JSONEncoder().encode(historyItems) else { return }
+        try? data.write(to: Self.historyFileURL, options: .atomic)
+    }
 
     func deleteItem(_ id: Int) {
         if let idx = historyItems.firstIndex(where: { $0.id == id }) {
@@ -615,8 +634,9 @@ class CameraManager: NSObject, ObservableObject {
         init(completion: @escaping (URL?) -> Void) { self.completion = completion }
         func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
             guard let data = photo.fileDataRepresentation() else { completion(nil); return }
-            let tempDir = FileManager.default.temporaryDirectory
-            let url = tempDir.appendingPathComponent(UUID().uuidString + ".jpg")
+            // Documents (not temporaryDirectory) so captured photos survive relaunch, matching video storage.
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            let url = docs.appendingPathComponent(UUID().uuidString + ".jpg")
             do {
                 try data.write(to: url)
                 completion(url)
